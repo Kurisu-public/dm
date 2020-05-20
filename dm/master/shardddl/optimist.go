@@ -15,12 +15,17 @@ package shardddl
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"go.etcd.io/etcd/clientv3"
 	"go.uber.org/zap"
 
+	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/dm/pb"
 	"github.com/pingcap/dm/pkg/etcdutil"
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/shardddl/optimism"
@@ -104,6 +109,51 @@ func (o *Optimist) Locks() map[string]*optimism.Lock {
 	return o.lk.Locks()
 }
 
+// ShowLocks is used by `show-ddl-locks` command.
+func (o *Optimist) ShowLocks(task string, sources []string) []*pb.DDLLock {
+	locks := o.lk.Locks()
+	ret := make([]*pb.DDLLock, 0, len(locks))
+	for _, lock := range locks {
+		if task != "" && task != lock.Task {
+			continue // specify task but mismatch
+		}
+		ready := lock.Ready()
+		if len(sources) > 0 {
+			for _, source := range sources {
+				if _, ok := ready[source]; ok {
+					goto FOUND // if any source matched, show lock for it.
+				}
+			}
+			continue // specify sources but mismath
+		}
+	FOUND:
+		l := &pb.DDLLock{
+			ID:       lock.ID,
+			Task:     lock.Task,
+			Mode:     config.ShardOptimistic,
+			Owner:    "",  // N/A for the optimistic mode
+			DDLs:     nil, // N/A for the optimistic mode
+			Synced:   make([]string, 0, len(ready)),
+			Unsynced: make([]string, 0, len(ready)),
+		}
+		for source, schemaTables := range ready {
+			for schema, tables := range schemaTables {
+				for table, synced := range tables {
+					if synced {
+						l.Synced = append(l.Synced, fmt.Sprintf("%s-%s", source, dbutil.TableName(schema, table)))
+					} else {
+						l.Unsynced = append(l.Unsynced, fmt.Sprintf("%s-%s", source, dbutil.TableName(schema, table)))
+					}
+				}
+			}
+		}
+		sort.Strings(l.Synced)
+		sort.Strings(l.Unsynced)
+		ret = append(ret, l)
+	}
+	return ret
+}
+
 // run runs jobs in the background.
 func (o *Optimist) run(ctx context.Context, revSource, revInfo, revOperation int64) error {
 	for {
@@ -176,16 +226,16 @@ func (o *Optimist) recoverLocks(
 	opm map[string]map[string]map[string]map[string]optimism.Operation) error {
 	// construct locks based on the shard DDL info.
 	for task, ifTask := range ifm {
-		sts := o.tk.FindTables(task)
 		for _, ifSource := range ifTask {
 			for _, ifSchema := range ifSource {
 				for _, info := range ifSchema {
-					_, _, err := o.lk.TrySync(info, sts)
+					tts := o.tk.FindTables(task, info.DownSchema, info.DownTable)
+					_, _, err := o.lk.TrySync(info, tts)
 					if err != nil {
 						return err
 					}
 					// never mark the lock operation from `done` to `not-done` when recovering.
-					err = o.handleLock(info, sts, true)
+					err = o.handleLock(info, tts, true)
 					if err != nil {
 						return err
 					}
@@ -319,29 +369,29 @@ func (o *Optimist) handleInfo(ctx context.Context, infoCh <-chan optimism.Info) 
 				// and remove the table name from table keeper.
 				removed := lock.TryRemoveTable(info.Source, info.UpSchema, info.UpTable)
 				o.logger.Debug("the table name remove from the table keeper", zap.Bool("removed", removed), zap.Stringer("info", info))
-				removed = o.tk.RemoveTable(info.Task, info.Source, info.UpSchema, info.UpTable)
+				removed = o.tk.RemoveTable(info.Task, info.Source, info.UpSchema, info.UpTable, info.DownSchema, info.DownTable)
 				o.logger.Debug("a table removed for info from the lock", zap.Bool("removed", removed), zap.Stringer("info", info))
 				continue
 			}
 
-			added := o.tk.AddTable(info.Task, info.Source, info.UpSchema, info.UpTable)
+			added := o.tk.AddTable(info.Task, info.Source, info.UpSchema, info.UpTable, info.DownSchema, info.DownTable)
 			o.logger.Debug("a table added for info", zap.Bool("added", added), zap.Stringer("info", info))
 
-			sts := o.tk.FindTables(info.Task)
-			if sts == nil {
+			tts := o.tk.FindTables(info.Task, info.DownSchema, info.DownTable)
+			if tts == nil {
 				// WATCH for SourceTables may fall behind WATCH for Info although PUT earlier,
 				// so we try to get SourceTables again.
 				// NOTE: check SourceTables for `info.Source` if needed later.
 				stm, _, err := optimism.GetAllSourceTables(o.cli)
 				if err != nil {
 					o.logger.Error("fail to get source tables", log.ShortError(err))
-				} else if stTask, ok := stm[info.Task]; ok {
-					sts = optimism.SourceTablesMapToSlice(stTask)
+				} else if tts2 := optimism.TargetTablesForTask(info.Task, info.DownSchema, info.DownTable, stm); tts2 != nil {
+					tts = tts2
 				}
 			}
 			// put operation for the table. we don't set `skipDone=true` now,
 			// because in optimism mode, one table may execute/done multiple DDLs but other tables may do nothing.
-			err := o.handleLock(info, sts, false)
+			err := o.handleLock(info, tts, false)
 			if err != nil {
 				// TODO: add & update metrics.
 				o.logger.Error("fail to handle the shard DDL lock", zap.Stringer("info", info), log.ShortError(err))
@@ -371,12 +421,11 @@ func (o *Optimist) handleOperationPut(ctx context.Context, opCh <-chan optimism.
 			if lock == nil {
 				o.logger.Warn("no lock for the shard DDL lock operation exist", zap.Stringer("operation", op))
 				continue
-			} else if synced, _ := lock.IsSynced(); !synced {
-				// this should not happen in normal case.
-				o.logger.Warn("the lock for the shard DDL lock operation has not synced", zap.Stringer("operation", op))
-				continue
 			}
 
+			// in optimistic mode, we always try to mark a table as done after received the `done` status of the DDLs operation.
+			// NOTE: even all tables have done their previous DDLs operations, the lock may still not resolved,
+			/// because these tables may have different schemas.
 			done := lock.TryMarkDone(op.Source, op.UpSchema, op.UpTable)
 			o.logger.Info("mark operation for a table as done", zap.Bool("done", done), zap.Stringer("operation", op))
 			if !lock.IsResolved() {
@@ -396,8 +445,8 @@ func (o *Optimist) handleOperationPut(ctx context.Context, opCh <-chan optimism.
 }
 
 // handleLock handles a single shard DDL lock.
-func (o *Optimist) handleLock(info optimism.Info, sts []optimism.SourceTables, skipDone bool) error {
-	lockID, newDDLs, err := o.lk.TrySync(info, sts)
+func (o *Optimist) handleLock(info optimism.Info, tts []optimism.TargetTable, skipDone bool) error {
+	lockID, newDDLs, err := o.lk.TrySync(info, tts)
 	var cfStage = optimism.ConflictNone
 	if err != nil {
 		cfStage = optimism.ConflictDetected // we treat any errors returned from `TrySync` as conflict detected now.

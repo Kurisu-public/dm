@@ -22,6 +22,8 @@ import (
 	"go.etcd.io/etcd/clientv3"
 	"go.uber.org/zap"
 
+	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/dm/pb"
 	"github.com/pingcap/dm/pkg/etcdutil"
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/shardddl/pessimism"
@@ -217,6 +219,47 @@ func (p *Pessimist) Locks() map[string]*pessimism.Lock {
 	return p.lk.Locks()
 }
 
+// ShowLocks is used by `show-ddl-locks` command.
+func (p *Pessimist) ShowLocks(task string, sources []string) []*pb.DDLLock {
+	locks := p.lk.Locks()
+	ret := make([]*pb.DDLLock, 0, len(locks))
+	for _, lock := range locks {
+		if task != "" && task != lock.Task {
+			continue // specify task but mismatch
+		}
+		ready := lock.Ready()
+		if len(sources) > 0 {
+			for _, worker := range sources {
+				if _, ok := ready[worker]; ok {
+					goto FOUND // if any source matched, show lock for it.
+				}
+			}
+			continue // specify workers but mismatch
+		}
+	FOUND:
+		l := &pb.DDLLock{
+			ID:       lock.ID,
+			Task:     lock.Task,
+			Mode:     config.ShardPessimistic,
+			Owner:    lock.Owner,
+			DDLs:     lock.DDLs,
+			Synced:   make([]string, 0, len(ready)),
+			Unsynced: make([]string, 0, len(ready)),
+		}
+		for worker, synced := range ready {
+			if synced {
+				l.Synced = append(l.Synced, worker)
+			} else {
+				l.Unsynced = append(l.Unsynced, worker)
+			}
+		}
+		sort.Strings(l.Synced)
+		sort.Strings(l.Unsynced)
+		ret = append(ret, l)
+	}
+	return ret
+}
+
 // UnlockLock unlocks a shard DDL lock manually when using `unlock-ddl-lock` command.
 // ID: the shard DDL lock ID.
 // replaceOwner: the new owner used to replace the original DDL for executing DDL to downstream.
@@ -395,6 +438,13 @@ func (p *Pessimist) handleInfoPut(ctx context.Context, infoCh <-chan pessimism.I
 			lockID, synced, remain, err := p.lk.TrySync(info, p.taskSources(info.Task))
 			if err != nil {
 				// TODO: add & update metrics.
+				// FIXME: the following case is not supported automatically now, try to support it later.
+				// - the lock become synced, and `done` for `exec` operation received.
+				// - put `skip` operation for non-owners and the lock is still not resolved.
+				// - another new DDL from the old owner received and TrySync again with an error returned.
+				// after the old lock resolved, the new DDL from the old owner will NOT be handled again,
+				// then the lock will be block because the Pessimist thinks missing DDL from some sources.
+				// now, we need to `pause-task` and `resume-task` to let DM-workers put DDL again to trigger the process.
 				p.logger.Error("fail to try sync shard DDL lock", zap.Stringer("info", info), log.ShortError(err))
 				continue
 			} else if !synced {

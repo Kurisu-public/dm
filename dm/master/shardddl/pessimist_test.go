@@ -26,6 +26,8 @@ import (
 	"go.etcd.io/etcd/integration"
 
 	"github.com/pingcap/dm/dm/common"
+	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/dm/pb"
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/shardddl/pessimism"
 	"github.com/pingcap/dm/pkg/terror"
@@ -76,7 +78,7 @@ func (t *testPessimist) testPessimistProgress(c *C, restart int) {
 	defer clearTestInfoOperation(c)
 
 	var (
-		watchTimeout  = 500 * time.Millisecond
+		watchTimeout  = 2 * time.Second
 		task1         = "task-pessimist-1"
 		task2         = "task-pessimist-2"
 		source1       = "mysql-replica-1"
@@ -201,6 +203,7 @@ func (t *testPessimist) testPessimistProgress(c *C, restart int) {
 		return !ok
 	}), IsTrue)
 	c.Assert(p.Locks(), HasLen, 0)
+	c.Assert(p.ShowLocks("", nil), HasLen, 0)
 
 	// PUT i21, i22, this will create a lock.
 	_, err = pessimism.PutInfo(etcdTestCli, i21)
@@ -223,6 +226,27 @@ func (t *testPessimist) testPessimistProgress(c *C, restart int) {
 	synced, remain = p.Locks()[ID2].IsSynced()
 	c.Assert(synced, IsFalse)
 	c.Assert(remain, Equals, 1)
+
+	// check ShowLocks.
+	expectedLock := []*pb.DDLLock{
+		{
+			ID:       ID2,
+			Task:     i21.Task,
+			Mode:     config.ShardPessimistic,
+			Owner:    i21.Source,
+			DDLs:     i21.DDLs,
+			Synced:   []string{i21.Source, i22.Source},
+			Unsynced: []string{i23.Source},
+		},
+	}
+	c.Assert(p.ShowLocks("", []string{}), DeepEquals, expectedLock)
+	c.Assert(p.ShowLocks(i21.Task, []string{}), DeepEquals, expectedLock)
+	c.Assert(p.ShowLocks("", []string{i21.Source}), DeepEquals, expectedLock)
+	c.Assert(p.ShowLocks("", []string{i23.Source}), DeepEquals, expectedLock)
+	c.Assert(p.ShowLocks("", []string{i22.Source, i23.Source}), DeepEquals, expectedLock)
+	c.Assert(p.ShowLocks(i21.Task, []string{i22.Source, i23.Source}), DeepEquals, expectedLock)
+	c.Assert(p.ShowLocks("not-exist", []string{}), HasLen, 0)
+	c.Assert(p.ShowLocks("", []string{"not-exist"}), HasLen, 0)
 
 	// PUT i23, then the lock will become synced.
 	rev3, err := pessimism.PutInfo(etcdTestCli, i23)
@@ -317,7 +341,7 @@ func (t *testPessimist) TestSourceReEntrant(c *C) {
 	defer clearTestInfoOperation(c)
 
 	var (
-		watchTimeout  = 500 * time.Millisecond
+		watchTimeout  = 2 * time.Second
 		task          = "task-source-re-entrant"
 		source1       = "mysql-replica-1"
 		source2       = "mysql-replica-2"
@@ -514,7 +538,7 @@ func (t *testPessimist) TestUnlockSourceMissBeforeSynced(c *C) {
 	}()
 
 	var (
-		watchTimeout  = 500 * time.Millisecond
+		watchTimeout  = 2 * time.Second
 		task          = "task-unlock-source-lack-before-synced"
 		source1       = "mysql-replica-1"
 		source2       = "mysql-replica-2"
@@ -607,7 +631,7 @@ func (t *testPessimist) TestUnlockSourceInterrupt(c *C) {
 	}()
 
 	var (
-		watchTimeout  = 500 * time.Millisecond
+		watchTimeout  = 2 * time.Second
 		task          = "task-unlock-source-interrupt"
 		source1       = "mysql-replica-1"
 		source2       = "mysql-replica-2"
@@ -723,7 +747,7 @@ func (t *testPessimist) TestUnlockSourceOwnerRemoved(c *C) {
 	}()
 
 	var (
-		watchTimeout  = 500 * time.Millisecond
+		watchTimeout  = 2 * time.Second
 		task          = "task-unlock-source-owner-removed"
 		source1       = "mysql-replica-1"
 		source2       = "mysql-replica-2"
@@ -804,7 +828,7 @@ func (t *testPessimist) TestMeetEtcdCompactError(c *C) {
 	defer clearTestInfoOperation(c)
 
 	var (
-		watchTimeout  = 500 * time.Millisecond
+		watchTimeout  = 2 * time.Second
 		task1         = "task-pessimist-1"
 		task2         = "task-pessimist-2"
 		source1       = "mysql-replica-1"
@@ -874,7 +898,7 @@ func (t *testPessimist) TestMeetEtcdCompactError(c *C) {
 		}
 		cancel1()
 		select {
-		case err := <-errCh:
+		case err = <-errCh:
 			c.Assert(err, Equals, etcdErrCompacted)
 		case <-time.After(300 * time.Millisecond):
 			c.Fatal("fail to get etcd error compacted")

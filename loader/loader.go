@@ -358,6 +358,8 @@ type Loader struct {
 
 	// for every worker goroutine, not for every data file
 	workerWg *sync.WaitGroup
+	// for other goroutines
+	wg sync.WaitGroup
 
 	fileJobQueue       chan *fileJob
 	fileJobQueueClosed sync2.AtomicBool
@@ -503,13 +505,13 @@ func (l *Loader) Process(ctx context.Context, pr chan pb.ProcessResult) {
 	}
 
 	isCanceled := false
-	if len(errs) == 0 {
-		select {
-		case <-ctx.Done():
-			isCanceled = true
-		default:
-		}
-	} else {
+	select {
+	case <-ctx.Done():
+		isCanceled = true
+	default:
+	}
+
+	if len(errs) != 0 {
 		// pause because of error occurred
 		l.Pause()
 	}
@@ -580,7 +582,11 @@ func (l *Loader) Restore(ctx context.Context) error {
 		return err2
 	}
 
-	go l.PrintStatus(ctx)
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		l.PrintStatus(ctx)
+	}()
 
 	begin := time.Now()
 	err = l.restoreData(ctx)
@@ -638,8 +644,10 @@ func (l *Loader) stopLoad() {
 
 	l.closeFileJobQueue()
 	l.workerWg.Wait()
-
 	l.logCtx.L().Debug("all workers have been closed")
+
+	l.wg.Wait()
+	l.logCtx.L().Debug("all loader's go-routines have been closed")
 }
 
 // Pause pauses the process, and it can be resumed later
